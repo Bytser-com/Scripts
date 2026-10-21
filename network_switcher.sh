@@ -355,36 +355,120 @@ fi
 # Network Configuration Execution
 # ==============================================================================
 
-# Clean up previous VLAN connections created by this script
+# Detect whether NetworkManager (nmcli) is available and running
+USE_NMCLI=false
+if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
+    USE_NMCLI=true
+fi
+
+# Stop any standalone DHCP client processes bound to a specific interface
+release_dhcp_on_dev() {
+    local dev="$1"
+    [ -z "$dev" ] && return 0
+    if command -v dhclient >/dev/null 2>&1; then
+        dhclient -r -pf "/run/dhclient.${dev}.pid" "$dev" >/dev/null 2>&1 || true
+        dhclient -r "$dev" >/dev/null 2>&1 || true
+        pkill -f "dhclient.*(^|[[:space:]])${dev}([[:space:]]|$)" >/dev/null 2>&1 || true
+    fi
+    if command -v dhcpcd >/dev/null 2>&1; then
+        dhcpcd -k "$dev" >/dev/null 2>&1 || true
+    fi
+    if command -v udhcpc >/dev/null 2>&1; then
+        pkill -f "udhcpc.*-i[[:space:]]*${dev}([[:space:]]|$)" >/dev/null 2>&1 || true
+    fi
+}
+
+# Request a DHCP lease on a specific interface using available system tools
+request_dhcp_on_dev() {
+    local dev="$1"
+    [ -z "$dev" ] && return 1
+    if command -v dhclient >/dev/null 2>&1; then
+        release_dhcp_on_dev "$dev"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 8 dhclient -pf "/run/dhclient.${dev}.pid" "$dev" >/dev/null 2>&1 || \
+                dhclient -nw -pf "/run/dhclient.${dev}.pid" "$dev" >/dev/null 2>&1 || true
+        else
+            dhclient -nw -pf "/run/dhclient.${dev}.pid" "$dev" >/dev/null 2>&1 || \
+                dhclient "$dev" >/dev/null 2>&1 || true
+        fi
+        return 0
+    elif command -v dhcpcd >/dev/null 2>&1; then
+        dhcpcd -b "$dev" >/dev/null 2>&1 || true
+        return 0
+    elif command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -i "$dev" -b -q >/dev/null 2>&1 || true
+        return 0
+    elif command -v networkctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        networkctl reconfigure "$dev" >/dev/null 2>&1 || true
+        return 0
+    fi
+    return 1
+}
+
+# Wait up to 10 seconds for an IPv4 address on an interface
+wait_for_dhcp_ip() {
+    local dev="$1"
+    local ip=""
+    for _ in {1..10}; do
+        ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Bring down any active NetworkManager connection attached to the selected base interface ($IFACE)
+bring_down_base_connection() {
+    if [ "$USE_NMCLI" = true ]; then
+        nmcli -t -f DEVICE,UUID,NAME con show --active 2>/dev/null | while IFS=: read -r dev uuid name; do
+            if [ "$dev" = "$IFACE" ] && [ -n "$uuid" ]; then
+                echo "Bringing down active connection '$name' on $IFACE..."
+                nmcli connection down uuid "$uuid" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+    release_dhcp_on_dev "$IFACE"
+}
+
+# Clean up previous VLAN connections and VLAN sub-interfaces on $IFACE
 echo "Cleaning up previous VLAN connections..."
-nmcli -t -f NAME con show | grep "^vlan-" | while read -r con; do
-    nmcli con delete "$con" >/dev/null 2>&1
+if [ "$USE_NMCLI" = true ]; then
+    nmcli -t -f NAME con show 2>/dev/null | grep "^vlan-" | while read -r con; do
+        nmcli con delete "$con" >/dev/null 2>&1 || true
+    done
+fi
+
+# Clean up any kernel VLAN sub-interfaces attached to $IFACE (e.g. eth0.10)
+ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk -v iface="$IFACE" -F'@' '$2 == iface {print $1}' | while read -r vdev; do
+    if [ -n "$vdev" ]; then
+        release_dhcp_on_dev "$vdev"
+        ip addr flush dev "$vdev" 2>/dev/null || true
+        ip link set "$vdev" down 2>/dev/null || true
+        ip link delete "$vdev" 2>/dev/null || true
+    fi
 done
 
 if [ "$VLAN_ID" -eq 0 ]; then
     if [ "$USE_DHCP" = true ]; then
         echo "Reverting to untagged network on $IFACE using DHCP..."
+        release_dhcp_on_dev "$IFACE"
         ip link set "$IFACE" up
         ip addr flush dev "$IFACE" 2>/dev/null || true
-        nmcli dev set "$IFACE" managed yes >/dev/null 2>&1 || true
-        nmcli dev connect "$IFACE" >/dev/null 2>&1 || true
 
-        echo "Retrieving IP configuration via DHCP..."
-        ASSIGNED_IP=""
-        for i in {1..10}; do
-            ASSIGNED_IP=$(ip -4 addr show dev "$IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
-            if [ -n "$ASSIGNED_IP" ]; then
-                break
+        if [ "$USE_NMCLI" = true ]; then
+            nmcli dev set "$IFACE" managed yes >/dev/null 2>&1 || true
+            if ! nmcli dev connect "$IFACE" >/dev/null 2>&1; then
+                request_dhcp_on_dev "$IFACE" || true
             fi
-            sleep 1
-        done
-
-        if [ -z "$ASSIGNED_IP" ] && command -v dhcpcd >/dev/null 2>&1; then
-            dhcpcd -b "$IFACE" >/dev/null 2>&1 || true
-            sleep 2
-            ASSIGNED_IP=$(ip -4 addr show dev "$IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
+        else
+            request_dhcp_on_dev "$IFACE" || true
         fi
 
+        echo "Retrieving IP configuration via DHCP..."
+        ASSIGNED_IP=$(wait_for_dhcp_ip "$IFACE")
         ASSIGNED_GW=$(ip route show dev "$IFACE" 2>/dev/null | awk '/default/ {print $3}' | head -n1)
 
         if [ -n "$ASSIGNED_IP" ]; then
@@ -396,8 +480,7 @@ if [ "$VLAN_ID" -eq 0 ]; then
         fi
     else
         echo "Reverting to untagged network on $IFACE..."
-        # Connect the base interface to its default profile
-        nmcli dev connect "$IFACE" >/dev/null 2>&1 || true
+        bring_down_base_connection
         ip link set "$IFACE" up
         ip addr flush dev "$IFACE" 2>/dev/null || true
         if ! ip addr add "${IP}/${PREFIX}" dev "$IFACE"; then
@@ -412,62 +495,87 @@ if [ "$VLAN_ID" -eq 0 ]; then
         echo "Done! Your adapter ($IFACE) is now connected to the untagged network with IP ${IP}/${PREFIX}."
     fi
 else
+    bring_down_base_connection
+    ip addr flush dev "$IFACE" 2>/dev/null || true
+
     CON_NAME="vlan-${VLAN_ID}"
-    if [ "$USE_DHCP" = true ]; then
-        echo "Configuring VLAN $VLAN_ID on $IFACE using DHCP..."
-        nmcli con add type vlan con-name "$CON_NAME" dev "$IFACE" id "$VLAN_ID" ipv4.method auto ipv6.method auto autoconnect yes
-    else
-        echo "Configuring VLAN $VLAN_ID on $IFACE with IP ${IP}/${PREFIX}..."
-        NM_ARGS=()
-        if [ -n "$GATEWAY" ] && [ "$GATEWAY" != "none" ]; then
-            NM_ARGS+=(gw4 "$GATEWAY")
+    VLAN_DEV="${IFACE}.${VLAN_ID}"
+    NM_VLAN_SUCCESS=false
+
+    if [ "$USE_NMCLI" = true ]; then
+        if [ "$USE_DHCP" = true ]; then
+            echo "Configuring VLAN $VLAN_ID on $IFACE using DHCP..."
+            nmcli con add type vlan con-name "$CON_NAME" dev "$IFACE" id "$VLAN_ID" ipv4.method auto ipv6.method auto autoconnect yes
+        else
+            echo "Configuring VLAN $VLAN_ID on $IFACE with IP ${IP}/${PREFIX}..."
+            NM_ARGS=()
+            if [ -n "$GATEWAY" ] && [ "$GATEWAY" != "none" ]; then
+                NM_ARGS+=(gw4 "$GATEWAY")
+            fi
+            nmcli con add type vlan con-name "$CON_NAME" dev "$IFACE" id "$VLAN_ID" ip4 "${IP}/${PREFIX}" "${NM_ARGS[@]}" ipv6.method auto autoconnect yes
         fi
-        nmcli con add type vlan con-name "$CON_NAME" dev "$IFACE" id "$VLAN_ID" ip4 "${IP}/${PREFIX}" "${NM_ARGS[@]}" ipv6.method auto autoconnect yes
+
+        if [ $? -eq 0 ]; then
+            ip link set "$IFACE" up 2>/dev/null || true
+            echo "Bringing up VLAN connection $CON_NAME..."
+            if nmcli con up "$CON_NAME"; then
+                NM_VLAN_SUCCESS=true
+                # Ensure original connection stays down after parent link comes up
+                bring_down_base_connection
+                ip link set "$IFACE" up 2>/dev/null || true
+                NM_DETECTED_DEV=$(nmcli -t -f DEVICE con show id "$CON_NAME" 2>/dev/null | head -n1)
+                VLAN_DEV=${NM_DETECTED_DEV:-"$VLAN_DEV"}
+            else
+                echo "Warning: nmcli could not activate $CON_NAME, falling back to iproute2..."
+                nmcli con delete "$CON_NAME" >/dev/null 2>&1 || true
+            fi
+        fi
     fi
 
-    if [ $? -eq 0 ]; then
-        # Ensure base interface is up
-        ip link set "$IFACE" up 2>/dev/null || true
-        echo "Bringing up VLAN connection $CON_NAME..."
-        if ! nmcli con up "$CON_NAME"; then
-            echo "Error: Failed to bring up VLAN connection $CON_NAME."
+    # Headless / iproute2 fallback when NetworkManager is unavailable or interface is unmanaged
+    if [ "$NM_VLAN_SUCCESS" = false ]; then
+        echo "Configuring VLAN $VLAN_ID on $IFACE ($VLAN_DEV) using iproute2..."
+        modprobe 8021q >/dev/null 2>&1 || true
+        ip link set "$IFACE" up
+        ip link delete "$VLAN_DEV" >/dev/null 2>&1 || true
+        if ! ip link add link "$IFACE" name "$VLAN_DEV" type vlan id "$VLAN_ID"; then
+            echo "Error: Failed to create VLAN interface $VLAN_DEV."
+            exit 1
+        fi
+        if ! ip link set "$VLAN_DEV" up; then
+            echo "Error: Failed to bring up VLAN interface $VLAN_DEV."
             exit 1
         fi
 
         if [ "$USE_DHCP" = true ]; then
-            VLAN_DEV=$(nmcli -t -f DEVICE con show id "$CON_NAME" 2>/dev/null | head -n1)
-            VLAN_DEV=${VLAN_DEV:-"${IFACE}.${VLAN_ID}"}
-
-            echo "Retrieving IP configuration via DHCP..."
-            ASSIGNED_IP=""
-            for i in {1..10}; do
-                ASSIGNED_IP=$(ip -4 addr show dev "$VLAN_DEV" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
-                if [ -n "$ASSIGNED_IP" ]; then
-                    break
-                fi
-                sleep 1
-            done
-
-            if [ -z "$ASSIGNED_IP" ] && command -v dhcpcd >/dev/null 2>&1; then
-                dhcpcd -b "$VLAN_DEV" >/dev/null 2>&1 || true
-                sleep 2
-                ASSIGNED_IP=$(ip -4 addr show dev "$VLAN_DEV" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
-            fi
-
-            ASSIGNED_GW=$(ip route show dev "$VLAN_DEV" 2>/dev/null | awk '/default/ {print $3}' | head -n1)
-
-            if [ -n "$ASSIGNED_IP" ]; then
-                echo "Done! Your adapter is now connected to VLAN $VLAN_ID via DHCP."
-                echo "  - IP / Subnet: $ASSIGNED_IP"
-                echo "  - Gateway:     ${ASSIGNED_GW:-None}"
-            else
-                echo "Done! Your adapter is now connected to VLAN $VLAN_ID via DHCP (waiting for DHCP lease from server)."
-            fi
+            request_dhcp_on_dev "$VLAN_DEV" || true
         else
-            echo "Done! Your adapter is now connected to VLAN $VLAN_ID with IP ${IP}/${PREFIX}."
+            ip addr flush dev "$VLAN_DEV" 2>/dev/null || true
+            if ! ip addr add "${IP}/${PREFIX}" dev "$VLAN_DEV"; then
+                echo "Error: Failed to assign IP ${IP}/${PREFIX} to $VLAN_DEV."
+                exit 1
+            fi
+            if [ -n "$GATEWAY" ] && [ "$GATEWAY" != "none" ]; then
+                if ! ip route replace default via "$GATEWAY" dev "$VLAN_DEV" 2>/dev/null; then
+                    echo "Warning: Failed to set default gateway $GATEWAY on $VLAN_DEV."
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$USE_DHCP" = true ]; then
+        echo "Retrieving IP configuration via DHCP..."
+        ASSIGNED_IP=$(wait_for_dhcp_ip "$VLAN_DEV")
+        ASSIGNED_GW=$(ip route show dev "$VLAN_DEV" 2>/dev/null | awk '/default/ {print $3}' | head -n1)
+
+        if [ -n "$ASSIGNED_IP" ]; then
+            echo "Done! Your adapter is now connected to VLAN $VLAN_ID via DHCP."
+            echo "  - IP / Subnet: $ASSIGNED_IP"
+            echo "  - Gateway:     ${ASSIGNED_GW:-None}"
+        else
+            echo "Done! Your adapter is now connected to VLAN $VLAN_ID via DHCP (waiting for DHCP lease from server)."
         fi
     else
-        echo "Failed to create VLAN connection."
-        exit 1
+        echo "Done! Your adapter is now connected to VLAN $VLAN_ID with IP ${IP}/${PREFIX}."
     fi
 fi
