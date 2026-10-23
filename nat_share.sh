@@ -1015,8 +1015,9 @@ show_status() {
     if [ -n "${STATE_PORT_FORWARDS:-}" ]; then
         printf "  %-14s  %-10s  %-22s  %s\n" "Host Port" "Protocol" "Target Device IP:Port" "Status"
         printf "  %-14s  %-10s  %-22s  %s\n" "--------------" "----------" "----------------------" "--------"
-        local IFS=','
-        for pf_entry in $STATE_PORT_FORWARDS; do
+        local pf_entries=()
+        IFS=',' read -ra pf_entries <<< "$STATE_PORT_FORWARDS"
+        for pf_entry in "${pf_entries[@]}"; do
             local r_port r_dip r_dport r_proto
             IFS='|' read -r r_port r_dip r_dport r_proto <<< "$pf_entry"
             local proto_disp="TCP/UDP"
@@ -1028,18 +1029,113 @@ show_status() {
         echo "  (No port forwards configured for ${STATE_LAN_IP}/${STATE_LAN_PREFIX})"
     fi
 
-    # Display active DHCP leases
-    echo ""
-    echo -e "${BOLD}Connected Devices (DHCP Leases):${RESET}"
+    # Build a lookup map of recent DHCP hostnames/leases from syslog (if readable) and LEASE_FILE
+    # This recovers leases that were granted before a service restart or held by active clients
+    local -A lease_mac_to_ip=()
+    local -A lease_mac_to_name=()
+    local -A lease_mac_to_exp=()
+    local -a ordered_macs=()
+
     if [ -f "$LEASE_FILE" ] && [ -s "$LEASE_FILE" ]; then
-        printf "  %-17s  %-15s  %-20s  %-20s\n" "MAC Address" "IP Address" "Hostname" "Lease Expiry"
-        printf "  %-17s  %-15s  %-20s  %-20s\n" "-----------------" "---------------" "--------------------" "--------------------"
         while read -r exp mac ip name client_id; do
-            local exp_date
-            exp_date=$(date -d "@$exp" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "Active")
-            [ "$name" = "*" ] && name="<Unknown>"
-            printf "  %-17s  %-15s  %-20s  %-20s\n" "$mac" "$ip" "$name" "$exp_date"
+            [ -z "$mac" ] || [ -z "$ip" ] && continue
+            local mac_lc="${mac,,}"
+            lease_mac_to_ip["$mac_lc"]="$ip"
+            if [ -n "$name" ] && [ "$name" != "*" ]; then
+                lease_mac_to_name["$mac_lc"]="$name"
+            else
+                lease_mac_to_name["$mac_lc"]="<Unknown>"
+            fi
+            if [ "$exp" = "0" ]; then
+                lease_mac_to_exp["$mac_lc"]="Static / Infinite"
+            else
+                lease_mac_to_exp["$mac_lc"]=$(date -d "@$exp" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "Active")
+            fi
+            ordered_macs+=("$mac_lc")
         done < "$LEASE_FILE"
+    fi
+
+    # Also check syslog / journal for recent DHCPACKs on this interface & subnet
+    if [ -n "${STATE_LAN_DEV:-}" ]; then
+        local log_lines=""
+        if [ -r /var/log/syslog ]; then
+            log_lines=$(grep -E "DHCPACK\(${STATE_LAN_DEV}\)" /var/log/syslog 2>/dev/null | tail -n 100)
+        elif command -v journalctl >/dev/null 2>&1; then
+            log_lines=$(journalctl -t dnsmasq-dhcp -n 100 --no-pager 2>/dev/null | grep -E "DHCPACK\(${STATE_LAN_DEV}\)")
+        fi
+        if [ -n "$log_lines" ]; then
+            while read -r line; do
+                [ -z "$line" ] && continue
+                # Format: ... DHCPACK(iface) <IP> <MAC> [hostname]
+                local ack_part
+                ack_part="${line#*DHCPACK("${STATE_LAN_DEV}") }"
+                local l_ip l_mac l_name
+                read -r l_ip l_mac l_name <<< "$ack_part"
+                [ -z "$l_ip" ] || [ -z "$l_mac" ] && continue
+                if ! cidrs_overlap "${l_ip}/32" "${STATE_LAN_IP}/${STATE_LAN_PREFIX}"; then
+                    continue
+                fi
+                local mac_lc="${l_mac,,}"
+                if [ -z "${lease_mac_to_ip[$mac_lc]:-}" ]; then
+                    # Only include from log if not already in LEASE_FILE and within DHCP pool or active in ARP
+                    local in_arp=0
+                    if ip -4 neigh show dev "$STATE_LAN_DEV" 2>/dev/null | grep -qi "$mac_lc"; then
+                        in_arp=1
+                    fi
+                    if [ "$in_arp" -eq 1 ]; then
+                        lease_mac_to_ip["$mac_lc"]="$l_ip"
+                        lease_mac_to_name["$mac_lc"]="${l_name:-<Unknown>}"
+                        lease_mac_to_exp["$mac_lc"]="Active (DHCP)"
+                        ordered_macs+=("$mac_lc")
+                    fi
+                elif [ "${lease_mac_to_name[$mac_lc]:-<Unknown>}" = "<Unknown>" ] && [ -n "$l_name" ]; then
+                    lease_mac_to_name["$mac_lc"]="$l_name"
+                fi
+            done <<< "$log_lines"
+        fi
+    fi
+
+    # Also check active ARP/Neighbor table on STATE_LAN_DEV for any devices not yet listed
+    if [ -n "${STATE_LAN_DEV:-}" ]; then
+        while read -r n_ip _ n_mac n_state; do
+            [ -z "$n_ip" ] || [ -z "$n_mac" ] && continue
+            local mac_lc="${n_mac,,}"
+            if [ -z "${lease_mac_to_ip[$mac_lc]:-}" ]; then
+                lease_mac_to_ip["$mac_lc"]="$n_ip"
+                lease_mac_to_name["$mac_lc"]="<Static / ARP>"
+                # Check if IP falls inside the configured DHCP range
+                if [ -n "${STATE_DHCP_START:-}" ] && [ -n "${STATE_DHCP_END:-}" ]; then
+                    local ip_i s_i e_i
+                    ip_i=$(ip_to_int "$n_ip")
+                    s_i=$(ip_to_int "$STATE_DHCP_START")
+                    e_i=$(ip_to_int "$STATE_DHCP_END")
+                    if (( ip_i >= s_i && ip_i <= e_i )); then
+                        lease_mac_to_name["$mac_lc"]="<DHCP Client>"
+                        lease_mac_to_exp["$mac_lc"]="Active ($n_state)"
+                    else
+                        lease_mac_to_exp["$mac_lc"]="Static IP ($n_state)"
+                    fi
+                else
+                    lease_mac_to_exp["$mac_lc"]="Static IP ($n_state)"
+                fi
+                ordered_macs+=("$mac_lc")
+            fi
+        done < <(ip -4 neigh show dev "$STATE_LAN_DEV" 2>/dev/null | awk '$2 == "lladdr" && $4 ~ /^(REACHABLE|STALE|DELAY|PROBE|PERMANENT)$/ {print $1, $2, $3, $4}')
+    fi
+
+    # Display active DHCP leases & connected LAN devices
+    echo ""
+    echo -e "${BOLD}Connected Devices (DHCP Leases & Active LAN Clients):${RESET}"
+    if [ ${#ordered_macs[@]} -gt 0 ]; then
+        printf "  %-17s  %-15s  %-20s  %-20s\n" "MAC Address" "IP Address" "Hostname / Type" "Status / Lease Expiry"
+        printf "  %-17s  %-15s  %-20s  %-20s\n" "-----------------" "---------------" "--------------------" "---------------------"
+        for mac_lc in "${ordered_macs[@]}"; do
+            printf "  %-17s  %-15s  %-20s  %-20s\n" \
+                "$mac_lc" \
+                "${lease_mac_to_ip[$mac_lc]}" \
+                "${lease_mac_to_name[$mac_lc]}" \
+                "${lease_mac_to_exp[$mac_lc]}"
+        done
     else
         echo "  (No connected DHCP clients detected yet. Plug in a client device to connect.)"
     fi
@@ -1051,23 +1147,26 @@ monitor_leases() {
     clear_screen
     echo -e "${CYAN}Starting live lease monitor... (Press Ctrl+C to exit monitor)${RESET}\n"
     trap 'echo -e "\nMonitor closed. NAT sharing remains running in the background."; return 0' INT
-    local last_content=""
+    local last_content="__INITIAL__"
     while true; do
+        local current_content=""
         if [ -f "$LEASE_FILE" ]; then
-            local current_content
             current_content=$(cat "$LEASE_FILE" 2>/dev/null)
-            if [ "$current_content" != "$last_content" ]; then
-                clear_screen
-                show_status
-                echo -e "${DIM}--------------------------------------------------------------------${RESET}"
-                echo -e "${CYAN}Live Lease Monitor active. (Press Ctrl+C to exit monitor)${RESET}"
-                last_content="$current_content"
+        fi
+        if [ -f "$STATE_FILE" ]; then
+            local mon_lan_dev
+            mon_lan_dev=$(awk -F'=' '/^STATE_LAN_DEV=/ {gsub(/"/, "", $2); print $2}' "$STATE_FILE" 2>/dev/null)
+            if [ -n "$mon_lan_dev" ]; then
+                current_content="${current_content}"$'\n'"$(ip -4 neigh show dev "$mon_lan_dev" 2>/dev/null | awk '$2 == "lladdr" && $4 ~ /^(REACHABLE|STALE|DELAY|PROBE|PERMANENT)$/ {print $1, $3, $4}' | sort)"
             fi
-        else
+        fi
+
+        if [ "$current_content" != "$last_content" ]; then
             clear_screen
             show_status
             echo -e "${DIM}--------------------------------------------------------------------${RESET}"
             echo -e "${CYAN}Live Lease Monitor active. (Press Ctrl+C to exit monitor)${RESET}"
+            last_content="$current_content"
         fi
         sleep 2
     done
@@ -1110,7 +1209,10 @@ stop_nat() {
         fi
         rm -f "$PID_FILE"
     fi
-    rm -f "$LEASE_FILE"
+    local keep_leases="${1:-0}"
+    if [ "$keep_leases" != "1" ]; then
+        rm -f "$LEASE_FILE"
+    fi
     echo -e "${GREEN}[DONE]${RESET}"
 
     # 2. Remove iptables rules tagged with NAT_SHARE_RULE
@@ -1198,10 +1300,10 @@ stop_nat() {
 start_nat() {
     require_root "$@"
 
-    # If already running, clean up previous session first
+    # If already running, clean up previous session first (keep leases so active clients remain tracked)
     if [ -f "$STATE_FILE" ]; then
         echo -e "${YELLOW}An existing NAT sharing session was detected. Cleaning it up first...${RESET}"
-        stop_nat
+        stop_nat 1
         sleep 1
     fi
 
@@ -1695,6 +1797,17 @@ start_nat() {
             done
 
             touch "$LEASE_FILE" && chmod 666 "$LEASE_FILE"
+            # Prune any stale leases that do not belong to the selected LAN subnet
+            if [ -s "$LEASE_FILE" ]; then
+                local keep_lines=""
+                while read -r l_exp l_mac l_ip l_name l_cid; do
+                    [ -z "$l_ip" ] && continue
+                    if cidrs_overlap "${l_ip}/32" "${LAN_IP}/${LAN_PREFIX}"; then
+                        keep_lines="${keep_lines}${l_exp} ${l_mac} ${l_ip} ${l_name} ${l_cid}"$'\n'
+                    fi
+                done < "$LEASE_FILE"
+                printf "%s" "$keep_lines" > "$LEASE_FILE"
+            fi
             rm -f "$PID_FILE"
 
             local dhcp_netmask
