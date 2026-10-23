@@ -12,7 +12,7 @@ LEASE_FILE="/run/nat_share_dnsmasq.leases"
 BRIDGE_NAME="natbr0"
 POLICY_TABLE=199
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORTS_CONF="${NAT_SHARE_PORTS_CONF:-${SCRIPT_DIR}/nat_share-ports.conf}"
+PORTS_CONF="${NAT_SHARE_PORTS_CONF:-${SCRIPT_DIR}/nat_share.conf}"
 
 # Terminal formatting
 GREEN="\033[1;32m"
@@ -357,13 +357,16 @@ find_best_lan_subnet() {
 }
 
 # ==============================================================================
-# Port Forwarding Configuration Parser & Strict Validator
-# Reads nat_share-ports.conf, verifies JSON format, checks for unique network
-# entry, and validates all ports, protocols, and device IPs.
+# Network & Port Forwarding Configuration Parser & Strict Validator
+# Reads nat_share.conf, verifies JSON format, checks for unique network
+# entry, and validates DHCP range, ports, protocols, and device IPs.
 # ==============================================================================
 
 VALIDATED_PORT_FORWARDS=()
 MATCHED_PORT_CONF_FOUND=0
+CONFIG_DHCP_MODE=""
+CONFIG_DHCP_START=""
+CONFIG_DHCP_END=""
 
 validate_and_load_port_forwards() {
     local target_lan_ip="$1"
@@ -373,13 +376,16 @@ validate_and_load_port_forwards() {
 
     VALIDATED_PORT_FORWARDS=()
     MATCHED_PORT_CONF_FOUND=0
+    CONFIG_DHCP_MODE=""
+    CONFIG_DHCP_START=""
+    CONFIG_DHCP_END=""
 
     if [ ! -e "$conf_file" ]; then
         return 0
     fi
 
     if [ ! -f "$conf_file" ] || [ ! -r "$conf_file" ]; then
-        echo -e "${RED}${BOLD}Error: Port configuration file '$conf_file' is not a readable regular file.${RESET}"
+        echo -e "${RED}${BOLD}Error: Configuration file '$conf_file' is not a readable regular file.${RESET}"
         return 1
     fi
 
@@ -513,6 +519,66 @@ def cidr_bounds(ip, prefix):
     bcast_i = net_i | (~mask & 0xFFFFFFFF)
     return net_i, bcast_i
 
+def parse_dhcp(dhcp_val, gw_ip, net_int, bcast_int, prefix):
+    if dhcp_val is None or dhcp_val is False:
+        return ("none", "", ""), None
+    if isinstance(dhcp_val, str):
+        s = dhcp_val.strip()
+        if not s or s.lower() in ("none", "false", "disabled", "off", "no"):
+            return ("none", "", ""), None
+        if '-' not in s:
+            return None, f"invalid 'dhcp' value '{dhcp_val}' (expected 'START_IP-END_IP', 'START_IP-END_OCTET', or 'none')."
+        parts = s.split('-', 1)
+        start_part = parts[0].strip()
+        end_part = parts[1].strip()
+        gw_octets = gw_ip.split('.')
+
+        if '.' in start_part:
+            err = validate_host_or_net_ip(start_part, allow_net_addr=False)
+            if err:
+                return None, f"invalid DHCP start IP — {err}"
+            start_ip = start_part
+        elif re.match(r'^[0-9]+$', start_part):
+            val = int(start_part, 10)
+            if val < 1 or val > 254:
+                return None, f"DHCP start octet '{start_part}' is out of host range (1-254)."
+            start_ip = f"{gw_octets[0]}.{gw_octets[1]}.{gw_octets[2]}.{val}"
+        else:
+            return None, f"invalid DHCP start value '{start_part}'."
+
+        start_octets = start_ip.split('.')
+        if '.' in end_part:
+            err = validate_host_or_net_ip(end_part, allow_net_addr=False)
+            if err:
+                return None, f"invalid DHCP end IP — {err}"
+            end_ip = end_part
+        elif re.match(r'^[0-9]+$', end_part):
+            val = int(end_part, 10)
+            if val < 1 or val > 254:
+                return None, f"DHCP end octet '{end_part}' is out of host range (1-254)."
+            end_ip = f"{start_octets[0]}.{start_octets[1]}.{start_octets[2]}.{val}"
+        else:
+            return None, f"invalid DHCP end value '{end_part}'."
+
+        start_int = ip_to_int(start_ip)
+        end_int = ip_to_int(end_ip)
+        net_ip_str = int_to_ip(net_int)
+        first_host = int_to_ip(net_int + 1)
+        last_host = int_to_ip(bcast_int - 1)
+
+        if start_int <= net_int or start_int >= bcast_int:
+            return None, f"DHCP start IP '{start_ip}' is outside valid host range for {net_ip_str}/{prefix} ({first_host} - {last_host})."
+        if end_int <= net_int or end_int >= bcast_int:
+            return None, f"DHCP end IP '{end_ip}' is outside valid host range for {net_ip_str}/{prefix} ({first_host} - {last_host})."
+        if start_int > end_int:
+            return None, f"DHCP start IP '{start_ip}' cannot be greater than end IP '{end_ip}'."
+        gw_int = ip_to_int(gw_ip)
+        if start_int <= gw_int <= end_int:
+            return None, f"DHCP range '{start_ip} - {end_ip}' includes the LAN Gateway IP '{gw_ip}'."
+
+        return ("range", start_ip, end_ip), None
+    return None, f"'dhcp' must be a range string (e.g. '192.168.100.50-100') or 'none' (got {type(dhcp_val).__name__})."
+
 try:
     with open(conf_file, 'r', encoding='utf-8') as f:
         raw_text = f.read()
@@ -524,8 +590,22 @@ if not raw_text.strip():
     print(f"ERROR|Configuration file '{conf_file}' is empty. It must contain valid JSON.")
     sys.exit(1)
 
+# Allow unquoted `none` as a convenience in JSON for `"dhcp": none`
+normalized_text = re.sub(
+    r'("dhcp"\s*:\s*)none(\s*[,}\n\r])',
+    r'\1null\2',
+    raw_text,
+    flags=re.IGNORECASE
+)
+# Also handle missing comma after `"dhcp": none` before next key
+normalized_text = re.sub(
+    r'("dhcp"\s*:\s*(?:null|"[^"]*"))\s*(\n\s*"[a-zA-Z0-9_]+"s*:)',
+    r'\1,\2',
+    normalized_text
+)
+
 try:
-    data = json.loads(raw_text)
+    data = json.loads(normalized_text)
 except json.JSONDecodeError as e:
     print(f"ERROR|Invalid JSON format in '{conf_file}' at line {e.lineno}, column {e.colno}: {e.msg}")
     sys.exit(1)
@@ -545,7 +625,7 @@ else:
     sys.exit(1)
 
 errors = []
-ALLOWED_NET_KEYS = {"subnet", "mask", "ports", "forwards", "port_forwards", "rules", "comment", "description"}
+ALLOWED_NET_KEYS = {"subnet", "mask", "dhcp", "dhcp_range", "ports", "forwards", "port_forwards", "rules", "comment", "description"}
 ALLOWED_RULE_KEYS = {"port", "device_ip", "device_port", "protocol", "comment", "description"}
 
 check_all_mode = (target_lan_ip == "__ALL__")
@@ -609,21 +689,33 @@ for idx, entry in enumerate(configs, start=1):
     else:
         seen_networks[net_key] = idx
 
-    # Locate ports list key
+    # Parse DHCP configuration if present
+    dhcp_info = ("unset", "", "")
+    dhcp_key = "dhcp" if "dhcp" in entry else ("dhcp_range" if "dhcp_range" in entry else None)
+    if dhcp_key is not None:
+        gw_for_dhcp = target_lan_ip if (not check_all_mode and entry_net_int == target_net_int and prefix == target_prefix) else subnet_ip
+        parsed_dhcp, dhcp_err = parse_dhcp(entry[dhcp_key], gw_for_dhcp, entry_net_int, entry_bcast_int, prefix)
+        if dhcp_err:
+            errors.append(f"Network entry #{idx} ({subnet_ip}/{prefix}): Invalid '{dhcp_key}' — {dhcp_err}")
+        else:
+            dhcp_info = parsed_dhcp
+
+    # Locate ports list key (optional if empty)
     ports_key = None
     for k in ("ports", "forwards", "port_forwards", "rules"):
         if k in entry:
             ports_key = k
             break
     if ports_key is None:
-        errors.append(f"Network entry #{idx} ({subnet_ip}/{prefix}): Missing required 'ports' array.")
-        continue
-    if not isinstance(entry[ports_key], list):
+        ports_list = []
+    elif not isinstance(entry[ports_key], list):
         errors.append(f"Network entry #{idx} ({subnet_ip}/{prefix}): Field '{ports_key}' must be a JSON array '[ ... ]'.")
         continue
+    else:
+        ports_list = entry[ports_key]
 
     if check_all_mode:
-        matched_entries.append((idx, subnet_ip, prefix, entry_net_int, entry_bcast_int, entry[ports_key]))
+        matched_entries.append((idx, subnet_ip, prefix, entry_net_int, entry_bcast_int, ports_list, dhcp_info))
     else:
         # Check if this entry matches or collides with the network currently being set up
         same_network = (entry_net_int == target_net_int and prefix == target_prefix)
@@ -642,7 +734,7 @@ for idx, entry in enumerate(configs, start=1):
                     f"Network entry #{idx}: Subnet '{subnet_ip}/{prefix}' belongs to network {target_net_ip}/{target_prefix}, "
                     f"but 'subnet' must match the LAN Gateway IP ({target_lan_ip}) or network address ({target_net_ip})."
                 )
-            matched_entries.append((idx, subnet_ip, prefix, entry_net_int, entry_bcast_int, entry[ports_key]))
+            matched_entries.append((idx, subnet_ip, prefix, entry_net_int, entry_bcast_int, ports_list, dhcp_info))
         elif overlaps_target:
             errors.append(
                 f"Network entry #{idx}: Configured network '{subnet_ip}/{prefix}' overlaps with target network "
@@ -660,7 +752,7 @@ if not check_all_mode and len(matched_entries) > 1:
 validated_rules = []
 entries_to_validate = matched_entries if (check_all_mode or len(matched_entries) == 1) else []
 
-for (idx, subnet_ip, prefix, net_int, bcast_int, rules_list) in entries_to_validate:
+for (idx, subnet_ip, prefix, net_int, bcast_int, rules_list, dhcp_info) in entries_to_validate:
     gw_ip = target_lan_ip if not check_all_mode else subnet_ip
     net_ip_str = int_to_ip(net_int)
     bcast_ip_str = int_to_ip(bcast_int)
@@ -758,7 +850,9 @@ if not check_all_mode:
     if len(matched_entries) == 0:
         print("NO_MATCH")
     else:
+        m_dhcp = matched_entries[0][6]
         print(f"MATCHED|{matched_entries[0][1]}|{matched_entries[0][2]}|{len(validated_rules)}")
+        print(f"DHCP|{m_dhcp[0]}|{m_dhcp[1]}|{m_dhcp[2]}")
         for r in validated_rules:
             print(r)
 else:
@@ -772,7 +866,7 @@ PYEOF
     if [ $py_status -ne 0 ]; then
         echo ""
         echo -e "${RED}${BOLD}====================================================================${RESET}"
-        echo -e "${RED}${BOLD}     Port Forwarding Configuration Error (nat_share-ports.conf)     ${RESET}"
+        echo -e "${RED}${BOLD}        Configuration Error (${conf_file##*/})                      ${RESET}"
         echo -e "${RED}${BOLD}====================================================================${RESET}"
         echo -e "  File: ${YELLOW}${conf_file}${RESET}"
         if [ "$target_lan_ip" != "__ALL__" ]; then
@@ -798,6 +892,11 @@ PYEOF
                 ;;
             MATCHED)
                 MATCHED_PORT_CONF_FOUND=1
+                ;;
+            DHCP)
+                CONFIG_DHCP_MODE="$f1"
+                CONFIG_DHCP_START="$f2"
+                CONFIG_DHCP_END="$f3"
                 ;;
             RULE)
                 VALIDATED_PORT_FORWARDS+=("${f1}|${f2}|${f3}|${f4}")
@@ -841,13 +940,21 @@ check_ports_cli() {
         fi
         echo ""
         if [ "$MATCHED_PORT_CONF_FOUND" -eq 1 ]; then
-            echo -e "  ${GREEN}✓ Valid configuration found for ${t_ip}/${t_prefix} (${#VALIDATED_PORT_FORWARDS[@]} port forward rule(s)):${RESET}"
+            echo -e "  ${GREEN}✓ Valid configuration found for ${t_ip}/${t_prefix}:${RESET}"
+            if [ "$CONFIG_DHCP_MODE" = "range" ]; then
+                echo -e "    • DHCP Range:       ${CYAN}${CONFIG_DHCP_START} - ${CONFIG_DHCP_END}${RESET}"
+            elif [ "$CONFIG_DHCP_MODE" = "none" ]; then
+                echo -e "    • DHCP Range:       ${YELLOW}Disabled (none)${RESET}"
+            else
+                echo -e "    • DHCP Range:       ${DIM}Not specified in config (will prompt / use default)${RESET}"
+            fi
+            echo -e "    • Port Forwards:    ${BOLD}${#VALIDATED_PORT_FORWARDS[@]}${RESET} rule(s)"
             for rule in "${VALIDATED_PORT_FORWARDS[@]}"; do
                 IFS='|' read -r r_port r_dip r_dport r_proto <<< "$rule"
                 local proto_disp="TCP/UDP"
                 [ "$r_proto" = "tcp" ] && proto_disp="TCP"
                 [ "$r_proto" = "udp" ] && proto_disp="UDP"
-                printf "    • External Port %-6s (%-7s)  -->  %s:%s\n" "$r_port" "$proto_disp" "$r_dip" "$r_dport"
+                printf "      - External Port %-6s (%-7s)  -->  %s:%s\n" "$r_port" "$proto_disp" "$r_dip" "$r_dport"
             done
         else
             echo -e "  ${YELLOW}ℹ JSON syntax is valid, but no configuration entry matches network ${t_ip}/${t_prefix}.${RESET}"
@@ -859,7 +966,7 @@ check_ports_cli() {
             return 1
         fi
         echo ""
-        echo -e "  ${GREEN}✓ All network configurations and port rules in '$conf_file' are valid!${RESET}"
+        echo -e "  ${GREEN}✓ All network configurations, DHCP ranges, and port rules in '$conf_file' are valid!${RESET}"
         echo -e "  Total validated port forward rules across all networks: ${BOLD}${#VALIDATED_PORT_FORWARDS[@]}${RESET}"
         echo ""
         return 0
@@ -1405,23 +1512,45 @@ start_nat() {
         echo -e "  • ${DIM}File '${PORTS_CONF##*/}' not found (port forwarding skipped).${RESET}"
     fi
 
-    IFS=. read -r l1 l2 l3 l4 <<< "$LAN_IP"
-    DHCP_START="${l1}.${l2}.${l3}.50"
-    DHCP_END="${l1}.${l2}.${l3}.200"
-
     echo ""
     echo -e "${BOLD}DHCP Server Configuration:${RESET}"
-    echo "  • DHCP IP Range: ${CYAN}${DHCP_START} - ${DHCP_END}${RESET}"
-    read -p "Enable automatic DHCP server for connected devices? [Y/n]: " ENABLE_DHCP_CHOICE
-    ENABLE_DHCP_CHOICE="$(trim_whitespace "$ENABLE_DHCP_CHOICE")"
-    ENABLE_DHCP_CHOICE=${ENABLE_DHCP_CHOICE:-Y}
-
-    USE_DHCP=true
-    if [[ "${ENABLE_DHCP_CHOICE,,}" =~ ^n ]]; then
+    if [ "$MATCHED_PORT_CONF_FOUND" -eq 1 ] && [ "$CONFIG_DHCP_MODE" = "none" ]; then
         USE_DHCP=false
-        echo -e "  DHCP server disabled. Connected devices must configure static IP."
+        DHCP_START=""
+        DHCP_END=""
+        echo -e "  • Configured in ${PORTS_CONF##*/}: ${YELLOW}none (DHCP disabled)${RESET}"
+        echo -e "  • Connected devices must configure a static IP."
+    elif [ "$MATCHED_PORT_CONF_FOUND" -eq 1 ] && [ "$CONFIG_DHCP_MODE" = "range" ]; then
+        DHCP_START="$CONFIG_DHCP_START"
+        DHCP_END="$CONFIG_DHCP_END"
+        echo -e "  • DHCP IP Range (from ${PORTS_CONF##*/}): ${CYAN}${DHCP_START} - ${DHCP_END}${RESET}"
+        read -p "Enable automatic DHCP server with this range? [Y/n]: " ENABLE_DHCP_CHOICE
+        ENABLE_DHCP_CHOICE="$(trim_whitespace "$ENABLE_DHCP_CHOICE")"
+        ENABLE_DHCP_CHOICE=${ENABLE_DHCP_CHOICE:-Y}
+
+        USE_DHCP=true
+        if [[ "${ENABLE_DHCP_CHOICE,,}" =~ ^n ]]; then
+            USE_DHCP=false
+            echo -e "  DHCP server disabled. Connected devices must configure static IP."
+        else
+            echo -e "  DHCP server enabled (${DHCP_START} - ${DHCP_END})."
+        fi
     else
-        echo -e "  DHCP server enabled."
+        IFS=. read -r l1 l2 l3 l4 <<< "$LAN_IP"
+        DHCP_START="${l1}.${l2}.${l3}.50"
+        DHCP_END="${l1}.${l2}.${l3}.200"
+        echo -e "  • DHCP IP Range (default): ${CYAN}${DHCP_START} - ${DHCP_END}${RESET}"
+        read -p "Enable automatic DHCP server for connected devices? [Y/n]: " ENABLE_DHCP_CHOICE
+        ENABLE_DHCP_CHOICE="$(trim_whitespace "$ENABLE_DHCP_CHOICE")"
+        ENABLE_DHCP_CHOICE=${ENABLE_DHCP_CHOICE:-Y}
+
+        USE_DHCP=true
+        if [[ "${ENABLE_DHCP_CHOICE,,}" =~ ^n ]]; then
+            USE_DHCP=false
+            echo -e "  DHCP server disabled. Connected devices must configure static IP."
+        else
+            echo -e "  DHCP server enabled (${DHCP_START} - ${DHCP_END})."
+        fi
     fi
 
     # --------------------------------------------------------------------------
@@ -1568,6 +1697,9 @@ start_nat() {
             touch "$LEASE_FILE" && chmod 666 "$LEASE_FILE"
             rm -f "$PID_FILE"
 
+            local dhcp_netmask
+            dhcp_netmask=$(int_to_ip "$(( (0xFFFFFFFF << (32 - LAN_PREFIX)) & 0xFFFFFFFF ))")
+
             if ! dnsmasq \
                 --conf-file=/dev/null \
                 --no-hosts \
@@ -1576,7 +1708,7 @@ start_nat() {
                 --interface="$LAN_DEV" \
                 --except-interface=lo \
                 --listen-address="$LAN_IP" \
-                --dhcp-range="$DHCP_START,$DHCP_END,255.255.255.0,12h" \
+                --dhcp-range="$DHCP_START,$DHCP_END,$dhcp_netmask,12h" \
                 --dhcp-option=3,"$LAN_IP" \
                 --dhcp-option=6,"$DNS_SERVERS" \
                 --dhcp-leasefile="$LEASE_FILE" \
@@ -1592,7 +1724,7 @@ start_nat() {
                     --interface="$LAN_DEV" \
                     --except-interface=lo \
                     --listen-address="$LAN_IP" \
-                    --dhcp-range="$DHCP_START,$DHCP_END,255.255.255.0,12h" \
+                    --dhcp-range="$DHCP_START,$DHCP_END,$dhcp_netmask,12h" \
                     --dhcp-option=3,"$LAN_IP" \
                     --dhcp-option=6,"$DNS_SERVERS" \
                     --dhcp-leasefile="$LEASE_FILE" \
@@ -1609,7 +1741,7 @@ start_nat() {
             echo -e "  [6/6] ${YELLOW}Warning: 'dnsmasq' not installed. Clients must use static IP.${RESET}"
         fi
     else
-        echo -e "  [6/6] DHCP server disabled by user."
+        echo -e "  [6/6] DHCP server disabled."
     fi
 
     # Save state
